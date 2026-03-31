@@ -256,7 +256,9 @@ async def stream(channel_key: str, request: Request):
 def merged_playlist():
   lines = ["#EXTM3U"]
 
-  for key, entries in channel_index.items():
+  sorted_channels = sorted(channel_index.items(), key=lambda item: item[1][0]["idx"])
+
+  for key, entries in sorted_channels:
     entry = entries[0]
     idx = entry["idx"]
     name = entry["name"]

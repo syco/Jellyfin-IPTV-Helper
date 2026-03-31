@@ -32,6 +32,7 @@ M3U_HOST = config.get("general", "m3u_host", fallback="http://127.0.0.1:8000")
 TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
+ALLOW_EXTERNAL_PROGRAMS = config.get("general", "allow_external_programs", fallback=False)
 
 PROVIDERS = {}
 
@@ -183,15 +184,44 @@ async def stream(channel_key: str, request: Request):
     reason = "completed"
 
     try:
-      if USE_FFMPEG:
-        cmd = [
-          FFMPEG_PATH,
-          "-loglevel", "error",
-          "-i", provider["url"],
-          "-c", "copy",
-          "-f", "mpegts",
-          "pipe:1"
-        ]
+      if provider["url"].startswith("http://") or provider["url"].startswith("https://"):
+        if USE_FFMPEG:
+          cmd = [
+            FFMPEG_PATH,
+            "-loglevel", "error",
+            "-i", provider["url"],
+            "-c", "copy",
+            "-f", "mpegts",
+            "pipe:1"
+          ]
+
+          process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+          )
+
+          while True:
+            chunk = await process.stdout.read(188 * 50)
+            if not chunk:
+              reason = "source EOF"
+              break
+            if await request.is_disconnected():
+              reason = "client disconnected"
+              break
+            bytes_count += len(chunk)
+            yield chunk
+
+        else:
+          async with http_client.stream("GET", provider["url"]) as resp:
+            async for chunk in resp.aiter_bytes():
+              if await request.is_disconnected():
+                reason = "client disconnected"
+                break
+              bytes_count += len(chunk)
+              yield chunk
+      elif ALLOW_EXTERNAL_PROGRAMS:
+        cmd = [provider["url"]]
 
         process = await asyncio.create_subprocess_exec(
           *cmd,
@@ -209,15 +239,8 @@ async def stream(channel_key: str, request: Request):
             break
           bytes_count += len(chunk)
           yield chunk
-
       else:
-        async with http_client.stream("GET", provider["url"]) as resp:
-          async for chunk in resp.aiter_bytes():
-            if await request.is_disconnected():
-              reason = "client disconnected"
-              break
-            bytes_count += len(chunk)
-            yield chunk
+        raise Exception("External programs not allowed")
 
     except Exception:
       reason = "error"

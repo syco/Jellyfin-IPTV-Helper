@@ -6,6 +6,7 @@ import hashlib
 import httpx
 import logging
 import re
+import shutil
 import sys
 import uvicorn
 
@@ -33,6 +34,9 @@ TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
 ALLOW_EXTERNAL_PROGRAMS = config.get("general", "allow_external_programs", fallback=False)
+
+if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
+    raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
 
 PROVIDERS = {}
 

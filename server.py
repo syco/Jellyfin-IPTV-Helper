@@ -7,13 +7,14 @@ import httpx
 import logging
 import re
 import shutil
-import sys
+import socket
+import threading
 import uvicorn
 
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
+from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse
 from typing import Dict, List
 
 logging.basicConfig(
@@ -33,7 +34,9 @@ M3U_HOST = config.get("general", "m3u_host", fallback="http://127.0.0.1:8000")
 TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
-ALLOW_EXTERNAL_PROGRAMS = config.get("general", "allow_external_programs", fallback=False)
+ALLOW_EXTERNAL_APP = config.get("general", "allow_external_app", fallback=False)
+ENABLE_PLEX_SUPPORT = config.getboolean("general", "enable_plex_support", fallback=False)
+ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp", fallback=False))
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
     raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
@@ -49,6 +52,8 @@ for section in config.sections():
       "priority": config.getint(section, "priority", fallback=10),
     }
 
+TUNER_COUNT = sum(p["max_streams"] for p in PROVIDERS.values())
+
 CHANNEL_MAPPING = {}
 if config.has_section("mapping"):
     for orig_id, val in config.items("mapping"):
@@ -63,6 +68,69 @@ locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
 http_client: httpx.AsyncClient = None
+
+def generate_device_id(host, port):
+    """Generates a consistent device ID from host and port."""
+    hash_input = f"{host}:{port}".encode()
+    return hashlib.sha1(hash_input).hexdigest()[:8].upper()
+
+DEVICE_ID = generate_device_id(SERVER_HOST, SERVER_PORT)
+
+def run_ssdp_server():
+    """Runs the SSDP server to allow discovery on the network."""
+    ssdp_ip = "239.255.255.250"
+    ssdp_port = 1900
+
+    response_template = (
+        'HTTP/1.1 200 OK\r\n'
+        'CACHE-CONTROL: max-age=1800\r\n'
+        'EXT:\r\n'
+        'LOCATION: {host}/device.xml\r\n'
+        'SERVER: Linux/5.4.0, UPnP/1.0, jelly-proxy/1.0\r\n'
+        'ST: {st}\r\n'
+        'USN: uuid:{device_id}::{st}\r\n'
+        '\r\n'
+    )
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        sock.bind(('', ssdp_port))
+    except Exception as e:
+        logger.error(f"Failed to bind SSDP socket: {e}")
+        return
+
+    try:
+        mreq = socket.inet_aton(ssdp_ip) + socket.inet_aton(SERVER_HOST)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except Exception as e:
+        logger.warning(f"Could not join multicast group: {e}. SSDP discovery might not work.")
+
+    logger.info(f"SSDP server listening on UDP port {ssdp_port} for network discovery.")
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            message = data.decode('utf-8', errors='ignore')
+
+            if 'M-SEARCH' in message and 'ssdp:discover' in message:
+                st_match = re.search(r'(?i)^ST:\s*(.*)', message, re.MULTILINE)
+                if st_match:
+                    st = st_match.group(1).strip()
+
+                    if st in ('ssdp:all', 'upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
+                        logger.debug(f"Received SSDP M-SEARCH for '{st}' from {addr}, sending response.")
+
+                        for service_type in ('upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
+                            response = response_template.format(
+                                host=M3U_HOST,
+                                st=service_type,
+                                device_id=DEVICE_ID
+                            ).encode('utf-8')
+                            sock.sendto(response, addr)
+        except Exception as e:
+            logger.error(f"Error in SSDP server: {e}")
 
 async def parse_m3u(path: str, provider_id: str):
   if path.startswith(("http://", "https://")):
@@ -131,6 +199,8 @@ async def lifespan(app: FastAPI):
   global http_client
   http_client = httpx.AsyncClient(timeout=None)
   await load_all()
+  if ENABLE_SSDP:
+      threading.Thread(target=run_ssdp_server, daemon=True).start()
   yield
   await http_client.aclose()
 
@@ -224,7 +294,7 @@ async def stream(channel_key: str, request: Request):
                 break
               bytes_count += len(chunk)
               yield chunk
-      elif ALLOW_EXTERNAL_PROGRAMS:
+      elif ALLOW_EXTERNAL_APP:
         cmd = [provider["url"]]
 
         process = await asyncio.create_subprocess_exec(
@@ -301,6 +371,79 @@ def merged_playlist():
     lines.append(url)
 
   return PlainTextResponse("\n".join(lines))
+
+if ENABLE_PLEX_SUPPORT:
+  plex_router = APIRouter()
+
+  @plex_router.get("/discover.json")
+  async def discover():
+    return {
+      "FriendlyName": "jelly-proxy",
+      "Manufacturer": "Silicondust",
+      "ModelNumber": "HDTC-2US",
+      "FirmwareName": "hdhomerun_firmware_20170930",
+      "TunerCount": TUNER_COUNT,
+      "FirmwareVersion": "20250623",
+      "DeviceID": DEVICE_ID,
+      "DeviceAuth": "jelly-proxy",
+      "BaseURL": M3U_HOST,
+      "LineupURL": f"{M3U_HOST}/lineup.json"
+    }
+
+  @plex_router.get("/lineup_status.json")
+  async def lineup_status():
+    return {
+      "ScanInProgress": 0,
+      "ScanPossible": 1,
+      "Source": "Cable",
+      "SourceList": ["Cable"]
+    }
+
+  @plex_router.get("/lineup.json")
+  async def lineup():
+    lineup_data = []
+    sorted_channels = sorted(channel_index.items(), key=lambda item: item[1][0]["idx"])
+    for key, entries in sorted_channels:
+      entry = entries[0]
+      lineup_data.append({
+        "GuideNumber": str(entry["idx"]),
+        "GuideName": entry["name"],
+        "URL": f"{M3U_HOST}/{key}/",
+        "HD": 1,
+        "Favorite": 0,
+      })
+    return lineup_data
+
+  @plex_router.get("/device.xml")
+  async def device_xml():
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+  <root xmlns="urn:schemas-upnp-org:device-1-0">
+    <URLBase>{M3U_HOST}</URLBase>
+    <specVersion><major>1</major><minor>0</minor></specVersion>
+    <device>
+      <deviceType>urn:schemas-silicondust-com:device:HDHomeRun:1</deviceType>
+      <friendlyName>jelly-proxy</friendlyName>
+      <manufacturer>Silicondust</manufacturer>
+      <modelName>HDTC-2US</modelName>
+      <modelNumber>HDTC-2US</modelNumber>
+      <serialNumber>{DEVICE_ID}</serialNumber>
+      <UDN>uuid:{DEVICE_ID}</UDN>
+    </device>
+  </root>"""
+    return Response(content=xml_content, media_type="application/xml")
+
+  @plex_router.get("/auto/v{channel_number}")
+  async def auto_v(channel_number: str):
+    for key, entries in channel_index.items():
+      if entries and str(entries[0]["idx"]) == channel_number:
+        return RedirectResponse(url=f"/{key}/")
+    raise HTTPException(status_code=404, detail="Channel not found")
+
+  @plex_router.get("/")
+  async def root_redirect():
+    return RedirectResponse(url="/discover.json")
+
+  app.include_router(plex_router)
 
 if __name__ == "__main__":
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)

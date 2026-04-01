@@ -63,6 +63,7 @@ if config.has_section("mapping"):
             CHANNEL_MAPPING[orig_id] = (int(idx), new_id, new_name)
 
 channel_index: Dict[str, List[dict]] = defaultdict(list)
+raw_channels: List[dict] = []
 active_sessions: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -153,7 +154,17 @@ async def parse_m3u(path: str, provider_id: str):
       raw_name = line.split(",")[-1].strip()
       id_match = re.search(r'tvg-id="([^"]*)"', line)
       logo_match = re.search(r'tvg-logo="([^"]+)"', line)
+      current_logo = logo_match.group(1) if logo_match else None
+
       raw_id = hashlib.md5((id_match.group(1) if id_match else raw_name).encode()).hexdigest()
+
+      raw_channels.append({
+        "raw_id": raw_id,
+        "name": raw_name,
+        "logo": current_logo,
+        "provider": provider_id
+      })
+
 
       if CHANNEL_MAPPING:
         if raw_id not in CHANNEL_MAPPING:
@@ -169,7 +180,6 @@ async def parse_m3u(path: str, provider_id: str):
       else:
         current_idx, current_id, current_name = -1, raw_id, raw_name
 
-      current_logo = logo_match.group(1) if logo_match else None
     elif line and not line.startswith("#") and current_idx and current_id and current_name:
       channel_index[current_id].append({
         "idx": current_idx,
@@ -188,6 +198,7 @@ async def parse_m3u(path: str, provider_id: str):
 
 async def load_all():
   channel_index.clear()
+  raw_channels.clear()
   for provider, cfg in PROVIDERS.items():
     try:
       await parse_m3u(cfg["file"], provider)
@@ -371,6 +382,23 @@ def merged_playlist():
     lines.append(url)
 
   return PlainTextResponse("\n".join(lines))
+
+@app.get("/debug/all-channels")
+async def get_all_channels():
+  return raw_channels
+
+@app.get("/debug/unmapped-channels")
+async def get_unmapped_channels():
+  if not CHANNEL_MAPPING:
+    return []
+  return [c for c in raw_channels if c["raw_id"] not in CHANNEL_MAPPING]
+
+@app.get("/debug/unused-mappings")
+async def get_unused_mappings():
+  if not CHANNEL_MAPPING:
+    return {}
+  used_raw_ids = {c["raw_id"] for c in raw_channels}
+  return {k: v for k, v in CHANNEL_MAPPING.items() if k not in used_raw_ids}
 
 if ENABLE_PLEX_SUPPORT:
   plex_router = APIRouter()

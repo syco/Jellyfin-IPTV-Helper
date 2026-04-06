@@ -283,7 +283,7 @@ async def stream(channel_key: str, request: Request):
           process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
+            stderr=None
           )
 
           while True:
@@ -311,7 +311,7 @@ async def stream(channel_key: str, request: Request):
         process = await asyncio.create_subprocess_exec(
           *cmd,
           stdout=asyncio.subprocess.PIPE,
-          stderr=asyncio.subprocess.DEVNULL
+          stderr=None
         )
 
         while True:

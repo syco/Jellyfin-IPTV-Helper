@@ -241,7 +241,7 @@ def pick_provider(channel: str):
   for p, s in sorted_providers:
     provider_name = p["provider"]
     if active_sessions[provider_name] < PROVIDERS[provider_name]["max_streams"]:
-      logger.info(f"Selected provider '{provider}' for '{channel}' (score: {s:.2f})")
+      logger.info(f"Selected provider '{provider_name}' for '{channel}' (score: {s:.2f})")
       return p
 
   return None

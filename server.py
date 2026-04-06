@@ -6,6 +6,7 @@ import hashlib
 import httpx
 import logging
 import re
+import shlex
 import shutil
 import socket
 import threading
@@ -306,7 +307,7 @@ async def stream(channel_key: str, request: Request):
               bytes_count += len(chunk)
               yield chunk
       elif ALLOW_EXTERNAL_APP:
-        cmd = [provider["url"]]
+        cmd = shlex.split(provider["url"])
 
         process = await asyncio.create_subprocess_exec(
           *cmd,

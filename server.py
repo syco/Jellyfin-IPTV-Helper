@@ -65,7 +65,7 @@ if config.has_section("mapping"):
 
 channel_index: Dict[str, List[dict]] = defaultdict(list)
 raw_channels: List[dict] = []
-active_sessions: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+active_sessions: Dict[str, int] = defaultdict(int)
 locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
@@ -223,7 +223,7 @@ def pick_provider(channel: str):
 
   def score(p):
     provider = p["provider"]
-    usage = active_sessions[channel][provider]
+    usage = active_sessions[provider]
     base = PROVIDERS[provider]["priority"]
 
     score_val = base + usage
@@ -239,8 +239,8 @@ def pick_provider(channel: str):
   sorted_providers = sorted(scored_list, key=lambda x: x[1])
 
   for p, s in sorted_providers:
-    provider = p["provider"]
-    if active_sessions[channel][provider] < PROVIDERS[provider]["max_streams"]:
+    provider_name = p["provider"]
+    if active_sessions[provider_name] < PROVIDERS[provider_name]["max_streams"]:
       logger.info(f"Selected provider '{provider}' for '{channel}' (score: {s:.2f})")
       return p
 
@@ -253,13 +253,13 @@ async def stream(channel_key: str, request: Request):
 
   channel_name_display = channel_index[channel_key][0]["name"]
 
-  async with locks[channel_key]:
+  async with locks["session_management"]:
     provider = pick_provider(channel_key)
     if not provider:
       raise HTTPException(503, "No available providers")
 
     pname = provider["provider"]
-    active_sessions[channel_key][pname] += 1
+    active_sessions[pname] += 1
 
   logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {provider['url']}]")
 
@@ -335,6 +335,10 @@ async def stream(channel_key: str, request: Request):
         logger.warning(f"Error during stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}'. Metric penalty applied.")
 
     finally:
+      async with locks["session_management"]:
+        active_sessions[pname] = max(0, active_sessions[pname] - 1)
+        logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
+
       if process:
         try:
           process.kill()
@@ -354,10 +358,6 @@ async def stream(channel_key: str, request: Request):
         bitrate = (bytes_count * 8) / duration
         metrics[channel_key][pname] = metrics[channel_key][pname] * 0.8 + (1 / max(bitrate, 1))
         logger.debug(f"Metrics updated for '{channel_key}' [{pname}]: {metrics[channel_key][pname]:.2f}")
-
-      async with locks[channel_key]:
-        active_sessions[channel_key][pname] = max(0, active_sessions[channel_key][pname] - 1)
-        logger.debug(f"Active sessions for '{channel_key}' [{pname}]: {active_sessions[channel_key][pname]}")
 
   return StreamingResponse(generator(), media_type="video/mp2t")
 

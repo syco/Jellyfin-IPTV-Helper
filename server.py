@@ -370,7 +370,8 @@ def merged_playlist():
   for key, entries in sorted_channels:
     entry = entries[0]
     idx = entry["idx"]
-    name = entry["name"]
+    #name = entry["name"]
+    name = key
     logo = entry["logo"]
     url = f"{M3U_HOST}/{key}/"
 

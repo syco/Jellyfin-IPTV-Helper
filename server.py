@@ -428,6 +428,10 @@ if ENABLE_PLEX_SUPPORT:
       "SourceList": ["Cable"]
     }
 
+  @plex_router.post("/lineup.post")
+  async def lineup_post():
+    return Response(status_code=200)
+
   @plex_router.get("/lineup.json")
   async def lineup():
     lineup_data = []

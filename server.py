@@ -440,7 +440,7 @@ if ENABLE_PLEX_SUPPORT:
       entry = entries[0]
       lineup_data.append({
         "GuideNumber": str(entry["idx"]),
-        "GuideName": key,
+        "GuideName": f"{entry["name"]} ({key})",
         "URL": f"{M3U_HOST}/{key}/",
         "HD": 1,
         "Favorite": 0,

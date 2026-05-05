@@ -38,6 +38,7 @@ USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
 USE_STREAMLINK = config.getboolean("general", "use_streamlink", fallback=False)
 STREAMLINK_PATH = config.get("general", "streamlink_path", fallback="streamlink")
+STREAMLINK_QUALITY = config.get("general", "streamlink_quality", fallback="720p,480p,best")
 ALLOW_EXTERNAL_APP = config.get("general", "allow_external_app", fallback=False)
 ENABLE_PLEX_SUPPORT = config.getboolean("general", "enable_plex_support", fallback=False)
 ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp", fallback=False))
@@ -309,7 +310,7 @@ async def stream(channel_key: str, request: Request):
             "--stdout",
             "--loglevel", "error",
             provider["url"],
-            "480p,worst"
+            STREAMLINK_QUALITY
           ]
 
           process = await asyncio.create_subprocess_exec(

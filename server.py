@@ -15,7 +15,7 @@ import uvicorn
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
-from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from typing import Dict, List
 
 logging.basicConfig(
@@ -468,9 +468,9 @@ if ENABLE_PLEX_SUPPORT:
   plex_router = APIRouter()
 
   @plex_router.get("/discover.json")
-  async def discover(request: Request):
+  async def discover(request: Request, response: Response):
     logger.info(f"HDHomeRun discovery requested by {request.client.host if request.client else 'unknown'}")
-    return {
+    data = {
       "FriendlyName": "jelly-proxy",
       "Manufacturer": "Silicondust",
       "ModelNumber": "HDTC-2US",
@@ -482,22 +482,24 @@ if ENABLE_PLEX_SUPPORT:
       "BaseURL": M3U_HOST,
       "LineupURL": f"{M3U_HOST}/lineup.json"
     }
+    return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=3600"})
 
   @plex_router.get("/lineup_status.json")
-  async def lineup_status():
-    return {
+  async def lineup_status(response: Response):
+    data = {
       "ScanInProgress": 0,
       "ScanPossible": 1,
       "Source": "Cable",
       "SourceList": ["Cable"]
     }
+    return JSONResponse(content=data, headers={"Cache-Control": "public, max-age=3600"})
 
   @plex_router.post("/lineup.post")
   async def lineup_post():
     return Response(status_code=200)
 
   @plex_router.get("/lineup.json")
-  async def lineup(request: Request):
+  async def lineup(request: Request, response: Response):
     logger.info(f"HDHomeRun lineup requested by {request.client.host if request.client else 'unknown'}")
     lineup_data = []
     sorted_channels = sorted(channel_index.items(), key=lambda item: item[1][0]["idx"])
@@ -510,7 +512,7 @@ if ENABLE_PLEX_SUPPORT:
         "HD": 1,
         "Favorite": 0,
       })
-    return lineup_data
+    return JSONResponse(content=lineup_data, headers={"Cache-Control": "public, max-age=3600"})
 
   @plex_router.get("/device.xml")
   async def device_xml():

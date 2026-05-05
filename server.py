@@ -32,6 +32,7 @@ SERVER_HOST = config.get("server", "host", fallback="0.0.0.0")
 SERVER_PORT = config.getint("server", "port", fallback=8000)
 
 M3U_HOST = config.get("general", "m3u_host", fallback="http://127.0.0.1:8000")
+REFRESH_INTERVAL = config.getint("general", "refresh_interval", fallback=1440)
 TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
@@ -140,6 +141,7 @@ def run_ssdp_server():
             logger.error(f"Error in SSDP server: {e}")
 
 async def parse_m3u(path: str, provider_id: str):
+  logger.info(f"Parsing M3U for provider '{provider_id}' from {path}")
   if path.startswith(("http://", "https://")):
     resp = await http_client.get(path)
     resp.raise_for_status()
@@ -203,6 +205,7 @@ async def parse_m3u(path: str, provider_id: str):
   logger.info(f"Loaded {count} channels from provider '{provider_id}'")
 
 async def load_all():
+  logger.info("Refreshing all provider playlists...")
   channel_index.clear()
   raw_channels.clear()
   for provider, cfg in PROVIDERS.items():
@@ -210,15 +213,35 @@ async def load_all():
       await parse_m3u(cfg["file"], provider)
     except Exception as e:
       logger.error(f"Failed to load provider {provider}: {e}")
+  logger.info("Provider refresh complete.")
+
+async def periodic_refresh():
+  """Background task to refresh M3U lists at a configured interval."""
+  while True:
+    try:
+      await asyncio.sleep(REFRESH_INTERVAL * 60)
+      logger.info("Triggering scheduled refresh of provider playlists...")
+      await load_all()
+    except asyncio.CancelledError:
+      break
+    except Exception as e:
+      logger.error(f"Error during periodic refresh: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   global http_client
   http_client = httpx.AsyncClient(timeout=None)
   await load_all()
+
+  refresh_task = None
+  if REFRESH_INTERVAL > 0:
+    refresh_task = asyncio.create_task(periodic_refresh())
+
   if ENABLE_SSDP:
       threading.Thread(target=run_ssdp_server, daemon=True).start()
   yield
+  if refresh_task:
+    refresh_task.cancel()
   await http_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
@@ -253,7 +276,10 @@ def pick_provider(channel: str):
 
 @app.get("/{channel_key}/")
 async def stream(channel_key: str, request: Request):
+  client_host = request.client.host if request.client else "unknown"
+  logger.info(f"New stream request for channel key: '{channel_key}' from {client_host}")
   if channel_key not in channel_index:
+    logger.warning(f"Stream request failed: Channel key '{channel_key}' not found in index.")
     raise HTTPException(404, "Channel not found")
 
   channel_name_display = channel_index[channel_key][0]["name"]
@@ -277,6 +303,7 @@ async def stream(channel_key: str, request: Request):
     try:
       if provider["url"].startswith("http://") or provider["url"].startswith("https://"):
         if USE_STREAMLINK:
+          logger.info(f"Invoking Streamlink for '{channel_name_display}'")
           cmd = [
             STREAMLINK_PATH,
             "--stdout",
@@ -303,6 +330,7 @@ async def stream(channel_key: str, request: Request):
             yield chunk
 
         elif USE_FFMPEG:
+          logger.info(f"Invoking FFmpeg for '{channel_name_display}'")
           cmd = [
             FFMPEG_PATH,
             "-loglevel", "error",
@@ -331,6 +359,7 @@ async def stream(channel_key: str, request: Request):
             yield chunk
 
         else:
+          logger.info(f"Opening direct HTTP stream for '{channel_name_display}'")
           async with http_client.stream("GET", provider["url"]) as resp:
             async for chunk in resp.aiter_bytes():
               if await request.is_disconnected():
@@ -339,6 +368,7 @@ async def stream(channel_key: str, request: Request):
               bytes_count += len(chunk)
               yield chunk
       elif ALLOW_EXTERNAL_APP:
+        logger.info(f"Invoking external application for '{channel_name_display}'")
         cmd = shlex.split(provider["url"])
 
         process = await asyncio.create_subprocess_exec(
@@ -394,7 +424,8 @@ async def stream(channel_key: str, request: Request):
   return StreamingResponse(generator(), media_type="video/mp2t")
 
 @app.get("/playlist.m3u")
-def merged_playlist():
+def merged_playlist(request: Request):
+  logger.info(f"M3U playlist requested by {request.client.host if request.client else 'unknown'}")
   lines = ["#EXTM3U"]
 
   sorted_channels = sorted(channel_index.items(), key=lambda item: item[1][0]["idx"])
@@ -437,7 +468,8 @@ if ENABLE_PLEX_SUPPORT:
   plex_router = APIRouter()
 
   @plex_router.get("/discover.json")
-  async def discover():
+  async def discover(request: Request):
+    logger.info(f"HDHomeRun discovery requested by {request.client.host if request.client else 'unknown'}")
     return {
       "FriendlyName": "jelly-proxy",
       "Manufacturer": "Silicondust",
@@ -465,7 +497,8 @@ if ENABLE_PLEX_SUPPORT:
     return Response(status_code=200)
 
   @plex_router.get("/lineup.json")
-  async def lineup():
+  async def lineup(request: Request):
+    logger.info(f"HDHomeRun lineup requested by {request.client.host if request.client else 'unknown'}")
     lineup_data = []
     sorted_channels = sorted(channel_index.items(), key=lambda item: item[1][0]["idx"])
     for key, entries in sorted_channels:

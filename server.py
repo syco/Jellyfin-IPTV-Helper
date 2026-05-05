@@ -275,6 +275,15 @@ async def stream(channel_key: str, request: Request):
           cmd = [
             FFMPEG_PATH,
             "-loglevel", "error",
+            "-hide_banner",
+            "-fflags", "+genpts",
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-probesize", "512k",
+            "-analyzeduration", "500k",
+            "-thread_queue_size", "4096",
             "-i", provider["url"],
             "-c", "copy",
             "-f", "mpegts",
@@ -288,7 +297,7 @@ async def stream(channel_key: str, request: Request):
           )
 
           while True:
-            chunk = await process.stdout.read(188 * 50)
+            chunk = await process.stdout.read(188 * 1000)
             if not chunk:
               reason = "source EOF"
               break
@@ -316,7 +325,7 @@ async def stream(channel_key: str, request: Request):
         )
 
         while True:
-          chunk = await process.stdout.read(188 * 50)
+          chunk = await process.stdout.read(188 * 1000)
           if not chunk:
             reason = "source EOF"
             break

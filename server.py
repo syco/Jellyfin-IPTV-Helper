@@ -35,12 +35,17 @@ M3U_HOST = config.get("general", "m3u_host", fallback="http://127.0.0.1:8000")
 TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
+USE_STREAMLINK = config.getboolean("general", "use_streamlink", fallback=False)
+STREAMLINK_PATH = config.get("general", "streamlink_path", fallback="streamlink")
 ALLOW_EXTERNAL_APP = config.get("general", "allow_external_app", fallback=False)
 ENABLE_PLEX_SUPPORT = config.getboolean("general", "enable_plex_support", fallback=False)
 ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp", fallback=False))
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
     raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
+
+if USE_STREAMLINK and not shutil.which(STREAMLINK_PATH):
+    raise FileNotFoundError(f"Streamlink executable not found at '{STREAMLINK_PATH}'. Please ensure Streamlink is installed and the path is correctly configured in config.ini.")
 
 PROVIDERS = {}
 
@@ -271,16 +276,37 @@ async def stream(channel_key: str, request: Request):
 
     try:
       if provider["url"].startswith("http://") or provider["url"].startswith("https://"):
-        if USE_FFMPEG:
+        if USE_STREAMLINK:
+          cmd = [
+            STREAMLINK_PATH,
+            "--stdout",
+            "--loglevel", "error",
+            provider["url"],
+            "480p,worst"
+          ]
+
+          process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=None
+          )
+
+          while True:
+            chunk = await process.stdout.read(188 * 50)
+            if not chunk:
+              reason = "source EOF"
+              break
+            if await request.is_disconnected():
+              reason = "client disconnected"
+              break
+            bytes_count += len(chunk)
+            yield chunk
+
+        elif USE_FFMPEG:
           cmd = [
             FFMPEG_PATH,
             "-loglevel", "error",
             "-hide_banner",
-            "-fflags", "+genpts",
-            "-reconnect", "1",
-            "-reconnect_at_eof", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
             "-i", provider["url"],
             "-c", "copy",
             "-f", "mpegts",

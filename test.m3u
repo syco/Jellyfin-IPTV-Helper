@@ -1,0 +1,5 @@
+#EXTM3U
+
+#EXTINF:1 tvg-id="Test Module", TEST_MODULE
+module://example/test_stream_123
+

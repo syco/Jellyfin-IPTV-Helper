@@ -4,7 +4,10 @@ import asyncio
 import configparser
 import hashlib
 import httpx
+import importlib.util
+import inspect
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -16,13 +19,15 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
 from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
-from typing import Dict, List
+from typing import Any, Dict, List
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger("streamlink").setLevel(logging.CRITICAL)
+
 logger = logging.getLogger("iptv-proxy")
 
 config = configparser.ConfigParser()
@@ -37,19 +42,53 @@ TRACK_METRICS = config.getboolean("general", "track_metrics", fallback=False)
 USE_FFMPEG = config.getboolean("general", "use_ffmpeg", fallback=True)
 FFMPEG_PATH = config.get("general", "ffmpeg_path", fallback="ffmpeg")
 USE_STREAMLINK = config.getboolean("general", "use_streamlink", fallback=False)
-STREAMLINK_PATH = config.get("general", "streamlink_path", fallback="streamlink")
-STREAMLINK_QUALITY = config.get("general", "streamlink_quality", fallback="720p,480p,best")
+STREAMLINK_QUALITY = config.get("general", "streamlink_quality", fallback="720p,480p,best").split(',')
 ALLOW_EXTERNAL_APP = config.get("general", "allow_external_app", fallback=False)
 ENABLE_PLEX_SUPPORT = config.getboolean("general", "enable_plex_support", fallback=False)
 ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp", fallback=False))
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
-    raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
+  raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
 
-if USE_STREAMLINK and not shutil.which(STREAMLINK_PATH):
-    raise FileNotFoundError(f"Streamlink executable not found at '{STREAMLINK_PATH}'. Please ensure Streamlink is installed and the path is correctly configured in config.ini.")
+sl_session = None
+if USE_STREAMLINK:
+  try:
+    import streamlink
+    sl_session = streamlink.Streamlink()
+  except ImportError:
+    raise ImportError("Streamlink support is enabled in config, but the 'streamlink' package is not installed. Please run 'pip install streamlink'.")
 
 PROVIDERS = {}
+LOADED_MODULES: Dict[str, Any] = {}
+
+async def load_modules():
+  module_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
+  if not os.path.exists(module_dir):
+    os.makedirs(module_dir)
+    return
+
+  for filename in os.listdir(module_dir):
+    if filename.endswith(".py") and not filename.startswith("__"):
+      module_name = filename[:-3]
+      try:
+        spec = importlib.util.spec_from_file_location(module_name, os.path.join(module_dir, filename))
+        if spec and spec.loader:
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+
+          for attr in dir(mod):
+            obj = getattr(mod, attr)
+            if isinstance(obj, type) and hasattr(obj, "initialize") and hasattr(obj, "stream"):
+              instance = obj()
+              if inspect.iscoroutinefunction(instance.initialize):
+                await instance.initialize()
+              else:
+                instance.initialize()
+              LOADED_MODULES[module_name] = instance
+              logger.info(f"Loaded plugin module: {module_name}")
+              break
+      except Exception as e:
+        logger.error(f"Failed to load plugin '{module_name}': {e}")
 
 for section in config.sections():
   if section.startswith("provider:"):
@@ -64,11 +103,11 @@ TUNER_COUNT = sum(p["max_streams"] for p in PROVIDERS.values())
 
 CHANNEL_MAPPING = {}
 if config.has_section("mapping"):
-    for orig_id, val in config.items("mapping"):
-        parts = val.split("|")
-        if len(parts) == 3:
-            idx, new_id, new_name = parts
-            CHANNEL_MAPPING[orig_id] = (int(idx), new_id, new_name)
+  for orig_id, val in config.items("mapping"):
+    parts = val.split("|")
+    if len(parts) == 3:
+      idx, new_id, new_name = parts
+      CHANNEL_MAPPING[orig_id] = (int(idx), new_id, new_name)
 
 channel_index: Dict[str, List[dict]] = defaultdict(list)
 raw_channels: List[dict] = []
@@ -79,67 +118,67 @@ metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 http_client: httpx.AsyncClient = None
 
 def generate_device_id(host, port):
-    """Generates a consistent device ID from host and port."""
-    hash_input = f"{host}:{port}".encode()
-    return hashlib.sha1(hash_input).hexdigest()[:8].upper()
+  """Generates a consistent device ID from host and port."""
+  hash_input = f"{host}:{port}".encode()
+  return hashlib.sha1(hash_input).hexdigest()[:8].upper()
 
 DEVICE_ID = generate_device_id(SERVER_HOST, SERVER_PORT)
 
 def run_ssdp_server():
-    """Runs the SSDP server to allow discovery on the network."""
-    ssdp_ip = "239.255.255.250"
-    ssdp_port = 1900
+  """Runs the SSDP server to allow discovery on the network."""
+  ssdp_ip = "239.255.255.250"
+  ssdp_port = 1900
 
-    response_template = (
-        'HTTP/1.1 200 OK\r\n'
-        'CACHE-CONTROL: max-age=1800\r\n'
-        'EXT:\r\n'
-        'LOCATION: {host}/device.xml\r\n'
-        'SERVER: Linux/5.4.0, UPnP/1.0, jelly-proxy/1.0\r\n'
-        'ST: {st}\r\n'
-        'USN: uuid:{device_id}::{st}\r\n'
-        '\r\n'
-    )
+  response_template = (
+    'HTTP/1.1 200 OK\r\n'
+    'CACHE-CONTROL: max-age=1800\r\n'
+    'EXT:\r\n'
+    'LOCATION: {host}/device.xml\r\n'
+    'SERVER: Linux/5.4.0, UPnP/1.0, jelly-proxy/1.0\r\n'
+    'ST: {st}\r\n'
+    'USN: uuid:{device_id}::{st}\r\n'
+    '\r\n'
+  )
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+  sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+  try:
+    sock.bind(('', ssdp_port))
+  except Exception as e:
+    logger.error(f"Failed to bind SSDP socket: {e}")
+    return
+
+  try:
+    mreq = socket.inet_aton(ssdp_ip) + socket.inet_aton(SERVER_HOST)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+  except Exception as e:
+    logger.warning(f"Could not join multicast group: {e}. SSDP discovery might not work.")
+
+  logger.info(f"SSDP server listening on UDP port {ssdp_port} for network discovery.")
+
+  while True:
     try:
-        sock.bind(('', ssdp_port))
+      data, addr = sock.recvfrom(1024)
+      message = data.decode('utf-8', errors='ignore')
+
+      if 'M-SEARCH' in message and 'ssdp:discover' in message:
+        st_match = re.search(r'(?i)^ST:\s*(.*)', message, re.MULTILINE)
+        if st_match:
+          st = st_match.group(1).strip()
+
+          if st in ('ssdp:all', 'upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
+            logger.debug(f"Received SSDP M-SEARCH for '{st}' from {addr}, sending response.")
+
+            for service_type in ('upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
+              response = response_template.format(
+                host=M3U_HOST,
+                st=service_type,
+                device_id=DEVICE_ID
+              ).encode('utf-8')
+              sock.sendto(response, addr)
     except Exception as e:
-        logger.error(f"Failed to bind SSDP socket: {e}")
-        return
-
-    try:
-        mreq = socket.inet_aton(ssdp_ip) + socket.inet_aton(SERVER_HOST)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    except Exception as e:
-        logger.warning(f"Could not join multicast group: {e}. SSDP discovery might not work.")
-
-    logger.info(f"SSDP server listening on UDP port {ssdp_port} for network discovery.")
-
-    while True:
-        try:
-            data, addr = sock.recvfrom(1024)
-            message = data.decode('utf-8', errors='ignore')
-
-            if 'M-SEARCH' in message and 'ssdp:discover' in message:
-                st_match = re.search(r'(?i)^ST:\s*(.*)', message, re.MULTILINE)
-                if st_match:
-                    st = st_match.group(1).strip()
-
-                    if st in ('ssdp:all', 'upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
-                        logger.debug(f"Received SSDP M-SEARCH for '{st}' from {addr}, sending response.")
-
-                        for service_type in ('upnp:rootdevice', 'urn:schemas-silicondust-com:device:HDHomeRun:1'):
-                            response = response_template.format(
-                                host=M3U_HOST,
-                                st=service_type,
-                                device_id=DEVICE_ID
-                            ).encode('utf-8')
-                            sock.sendto(response, addr)
-        except Exception as e:
-            logger.error(f"Error in SSDP server: {e}")
+      logger.error(f"Error in SSDP server: {e}")
 
 async def parse_m3u(path: str, provider_id: str):
   logger.info(f"Parsing M3U for provider '{provider_id}' from {path}")
@@ -232,6 +271,7 @@ async def periodic_refresh():
 async def lifespan(app: FastAPI):
   global http_client
   http_client = httpx.AsyncClient(timeout=None)
+  await load_modules()
   await load_all()
 
   refresh_task = None
@@ -239,7 +279,7 @@ async def lifespan(app: FastAPI):
     refresh_task = asyncio.create_task(periodic_refresh())
 
   if ENABLE_SSDP:
-      threading.Thread(target=run_ssdp_server, daemon=True).start()
+    threading.Thread(target=run_ssdp_server, daemon=True).start()
   yield
   if refresh_task:
     refresh_task.cancel()
@@ -303,32 +343,47 @@ async def stream(channel_key: str, request: Request):
 
     try:
       if provider["url"].startswith("http://") or provider["url"].startswith("https://"):
-        if USE_STREAMLINK:
+        if USE_STREAMLINK and sl_session:
           logger.info(f"Invoking Streamlink for '{channel_name_display}'")
-          cmd = [
-            STREAMLINK_PATH,
-            "--stdout",
-            "--loglevel", "error",
-            provider["url"],
-            STREAMLINK_QUALITY
-          ]
 
-          process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=None
-          )
+          streams = await asyncio.to_thread(sl_session.streams, provider["url"])
+          if not streams:
+            raise Exception(f"No streams found for {provider['url']}")
 
-          while True:
-            chunk = await process.stdout.read(188 * 50)
-            if not chunk:
-              reason = "source EOF"
+          selected_stream = None
+          selected_quality = "N/A"
+          for quality in STREAMLINK_QUALITY:
+            if quality in streams:
+              selected_stream = streams[quality]
+              selected_quality = quality
               break
-            if await request.is_disconnected():
-              reason = "client disconnected"
-              break
-            bytes_count += len(chunk)
-            yield chunk
+
+          if not selected_stream:
+            if "best" in streams:
+              selected_stream = streams["best"]
+              selected_quality = "best"
+            elif streams:
+              selected_quality, selected_stream = list(streams.items())[0]
+
+          if not selected_stream:
+            raise Exception(f"Could not find a suitable stream for {provider['url']} with qualities {STREAMLINK_QUALITY}")
+
+          logger.debug(f"DEBUG: Playing stream (Quality: {selected_quality})")
+
+          fd = await asyncio.to_thread(selected_stream.open)
+          try:
+            while True:
+              chunk = await asyncio.to_thread(fd.read, 9400)
+              if not chunk:
+                reason = "source EOF"
+                break
+              if await request.is_disconnected():
+                reason = "client disconnected"
+                break
+              bytes_count += len(chunk)
+              yield chunk
+          finally:
+            await asyncio.to_thread(fd.close)
 
         elif USE_FFMPEG:
           logger.info(f"Invoking FFmpeg for '{channel_name_display}'")
@@ -349,7 +404,7 @@ async def stream(channel_key: str, request: Request):
           )
 
           while True:
-            chunk = await process.stdout.read(188 * 50)
+            chunk = await process.stdout.read(9400)
             if not chunk:
               reason = "source EOF"
               break
@@ -368,6 +423,24 @@ async def stream(channel_key: str, request: Request):
                 break
               bytes_count += len(chunk)
               yield chunk
+      elif provider["url"].startswith("module://"):
+        parts = provider["url"][9:].split("/", 1)
+        mod_name = parts[0]
+        mod_arg = parts[1] if len(parts) > 1 else ""
+
+        if mod_name in LOADED_MODULES:
+          plugin = LOADED_MODULES[mod_name]
+          logger.info(f"Invoking plugin '{mod_name}' for '{channel_name_display}' with arg '{mod_arg}'")
+
+          async for chunk in plugin.stream(mod_arg):
+            if await request.is_disconnected():
+              reason = "client disconnected"
+              break
+            bytes_count += len(chunk)
+            yield chunk
+        else:
+          raise Exception(f"Plugin module '{mod_name}' not found")
+
       elif ALLOW_EXTERNAL_APP:
         logger.info(f"Invoking external application for '{channel_name_display}'")
         cmd = shlex.split(provider["url"])
@@ -379,7 +452,7 @@ async def stream(channel_key: str, request: Request):
         )
 
         while True:
-          chunk = await process.stdout.read(188 * 50)
+          chunk = await process.stdout.read(9400)
           if not chunk:
             reason = "source EOF"
             break
@@ -391,11 +464,12 @@ async def stream(channel_key: str, request: Request):
       else:
         raise Exception("External programs not allowed")
 
-    except Exception:
+    except Exception as e:
       reason = "error"
+      logger.error(f"Stream generator error for '{channel_name_display}': {e}", exc_info=True)
       if TRACK_METRICS:
         metrics[channel_key][pname] += 5
-        logger.warning(f"Error during stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}'. Metric penalty applied.")
+        logger.warning(f"Metric penalty applied to '{pname}' due to error.")
 
     finally:
       async with locks["session_management"]:
@@ -547,4 +621,4 @@ if ENABLE_PLEX_SUPPORT:
   app.include_router(plex_router)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+  uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)

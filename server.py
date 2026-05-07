@@ -318,18 +318,6 @@ def pick_provider(channel: str):
 
   return None
 
-async def release_session(pname: str, channel_name: str, channel_key: str, url: str, start_time: float):
-  """Decrements active session count and logs stream closure for direct streams."""
-  async with locks["session_management"]:
-    active_sessions[pname] = max(0, active_sessions[pname] - 1)
-    logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
-
-  duration = asyncio.get_event_loop().time() - start_time
-  logger.info(
-    f"Stream stopped: '{channel_name}' (key: '{channel_key}') [{pname}] (Source: {url}). "
-    f"Duration: {duration:.1f}s, Reason: completed/disconnected (Direct)"
-  )
-
 async def external_app_stream(url: str):
   """Generates a stream from an external application for direct hand-off."""
   cmd = shlex.split(url)
@@ -376,38 +364,48 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
   url = provider["url"]
   logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {url}]")
 
-  if url.startswith("module://"):
-    parts = url[9:].split("/", 1)
-    mod_name = parts[0]
-    mod_arg = parts[1] if len(parts) > 1 else ""
-
-    if mod_name in LOADED_MODULES:
-      plugin = LOADED_MODULES[mod_name]
-      logger.info(f"Invoking plugin '{mod_name}' for '{channel_name_display}' (Direct Pass)")
-      background_tasks.add_task(release_session, pname, channel_name_display, channel_key, url, start_time)
-      return StreamingResponse(plugin.stream(mod_arg), media_type="video/mp2t")
-    else:
-      async with locks["session_management"]:
-        active_sessions[pname] = max(0, active_sessions[pname] - 1)
-      raise HTTPException(404, f"Plugin module '{mod_name}' not found")
-
-  if not url.startswith(("http://", "https://")):
-    if ALLOW_EXTERNAL_APP:
-      logger.info(f"Invoking external application for '{channel_name_display}' (Direct Pass)")
-      background_tasks.add_task(release_session, pname, channel_name_display, channel_key, url, start_time)
-      return StreamingResponse(external_app_stream(url), media_type="video/mp2t")
-    else:
-      async with locks["session_management"]:
-        active_sessions[pname] = max(0, active_sessions[pname] - 1)
-      raise HTTPException(403, "External applications are disabled")
-
   async def generator():
     bytes_count = 0
     process = None
     reason = "completed"
 
     try:
-      if provider["url"].startswith("http://") or provider["url"].startswith("https://"):
+      if url.startswith("module://"):
+        parts = url[9:].split("/", 1)
+        mod_name = parts[0]
+        mod_arg = parts[1] if len(parts) > 1 else ""
+
+        if mod_name in LOADED_MODULES:
+          plugin = LOADED_MODULES[mod_name]
+          logger.info(f"Invoking plugin '{mod_name}' for '{channel_name_display}'")
+
+          sig = inspect.signature(plugin.stream)
+          kwargs = {}
+          if "request" in sig.parameters:
+            kwargs["request"] = request
+
+          async for chunk in plugin.stream(mod_arg, **kwargs):
+            if await request.is_disconnected():
+              reason = "client disconnected"
+              break
+            bytes_count += len(chunk)
+            yield chunk
+        else:
+          raise Exception(f"Plugin module '{mod_name}' not found")
+
+      elif not url.startswith(("http://", "https://")):
+        if ALLOW_EXTERNAL_APP:
+          logger.info(f"Invoking external application for '{channel_name_display}'")
+          async for chunk in external_app_stream(url):
+            if await request.is_disconnected():
+              reason = "client disconnected"
+              break
+            bytes_count += len(chunk)
+            yield chunk
+        else:
+          raise Exception("External applications are disabled")
+
+      elif url.startswith("http://") or url.startswith("https://"):
         if USE_STREAMLINK and sl_session:
           logger.info(f"Invoking Streamlink for '{channel_name_display}'")
 

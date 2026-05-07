@@ -17,7 +17,7 @@ import uvicorn
 
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
+from fastapi import FastAPI, HTTPException, Request, Response, APIRouter, BackgroundTasks
 from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from typing import Any, Dict, List
 
@@ -315,8 +315,44 @@ def pick_provider(channel: str):
 
   return None
 
+async def release_session(pname: str, channel_name: str, channel_key: str, url: str, start_time: float):
+  """Decrements active session count and logs stream closure for direct streams."""
+  async with locks["session_management"]:
+    active_sessions[pname] = max(0, active_sessions[pname] - 1)
+    logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
+
+  duration = asyncio.get_event_loop().time() - start_time
+  logger.info(
+      f"Stream stopped: '{channel_name}' (key: '{channel_key}') [{pname}] (Source: {url}). "
+      f"Duration: {duration:.1f}s, Reason: completed/disconnected (Direct)"
+  )
+
+async def external_app_stream(url: str):
+  """Generates a stream from an external application for direct hand-off."""
+  cmd = shlex.split(url)
+  process = await asyncio.create_subprocess_exec(
+    *cmd,
+    stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.DEVNULL
+  )
+  try:
+    while True:
+      chunk = await process.stdout.read(9400)
+      if not chunk:
+        break
+      yield chunk
+  except Exception as e:
+    logger.error(f"External app stream error: {e}")
+  finally:
+    if process.returncode is None:
+      try:
+        process.kill()
+        await process.wait()
+      except Exception:
+        pass
+
 @app.get("/{channel_key}/")
-async def stream(channel_key: str, request: Request):
+async def stream(channel_key: str, request: Request, background_tasks: BackgroundTasks):
   client_host = request.client.host if request.client else "unknown"
   logger.info(f"New stream request for channel key: '{channel_key}' from {client_host}")
   if channel_key not in channel_index:
@@ -324,6 +360,7 @@ async def stream(channel_key: str, request: Request):
     raise HTTPException(404, "Channel not found")
 
   channel_name_display = channel_index[channel_key][0]["name"]
+  start_time = asyncio.get_event_loop().time()
 
   async with locks["session_management"]:
     provider = pick_provider(channel_key)
@@ -333,10 +370,35 @@ async def stream(channel_key: str, request: Request):
     pname = provider["provider"]
     active_sessions[pname] += 1
 
-  logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {provider['url']}]")
+  url = provider["url"]
+  logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {url}]")
+
+  if url.startswith("module://"):
+    parts = url[9:].split("/", 1)
+    mod_name = parts[0]
+    mod_arg = parts[1] if len(parts) > 1 else ""
+
+    if mod_name in LOADED_MODULES:
+      plugin = LOADED_MODULES[mod_name]
+      logger.info(f"Invoking plugin '{mod_name}' for '{channel_name_display}' (Direct Pass)")
+      background_tasks.add_task(release_session, pname, channel_name_display, channel_key, url, start_time)
+      return StreamingResponse(plugin.stream(mod_arg), media_type="video/mp2t")
+    else:
+      async with locks["session_management"]:
+        active_sessions[pname] = max(0, active_sessions[pname] - 1)
+      raise HTTPException(404, f"Plugin module '{mod_name}' not found")
+
+  if not url.startswith(("http://", "https://")):
+    if ALLOW_EXTERNAL_APP:
+      logger.info(f"Invoking external application for '{channel_name_display}' (Direct Pass)")
+      background_tasks.add_task(release_session, pname, channel_name_display, channel_key, url, start_time)
+      return StreamingResponse(external_app_stream(url), media_type="video/mp2t")
+    else:
+      async with locks["session_management"]:
+        active_sessions[pname] = max(0, active_sessions[pname] - 1)
+      raise HTTPException(403, "External applications are disabled")
 
   async def generator():
-    start = asyncio.get_event_loop().time()
     bytes_count = 0
     process = None
     reason = "completed"
@@ -423,46 +485,8 @@ async def stream(channel_key: str, request: Request):
                 break
               bytes_count += len(chunk)
               yield chunk
-      elif provider["url"].startswith("module://"):
-        parts = provider["url"][9:].split("/", 1)
-        mod_name = parts[0]
-        mod_arg = parts[1] if len(parts) > 1 else ""
-
-        if mod_name in LOADED_MODULES:
-          plugin = LOADED_MODULES[mod_name]
-          logger.info(f"Invoking plugin '{mod_name}' for '{channel_name_display}' with arg '{mod_arg}'")
-
-          async for chunk in plugin.stream(mod_arg):
-            if await request.is_disconnected():
-              reason = "client disconnected"
-              break
-            bytes_count += len(chunk)
-            yield chunk
-        else:
-          raise Exception(f"Plugin module '{mod_name}' not found")
-
-      elif ALLOW_EXTERNAL_APP:
-        logger.info(f"Invoking external application for '{channel_name_display}'")
-        cmd = shlex.split(provider["url"])
-
-        process = await asyncio.create_subprocess_exec(
-          *cmd,
-          stdout=asyncio.subprocess.PIPE,
-          stderr=None
-        )
-
-        while True:
-          chunk = await process.stdout.read(9400)
-          if not chunk:
-            reason = "source EOF"
-            break
-          if await request.is_disconnected():
-            reason = "client disconnected"
-            break
-          bytes_count += len(chunk)
-          yield chunk
       else:
-        raise Exception("External programs not allowed")
+        raise Exception("Invalid stream protocol or configuration")
 
     except Exception as e:
       reason = "error"
@@ -483,11 +507,11 @@ async def stream(channel_key: str, request: Request):
         except ProcessLookupError:
           logger.debug(f"FFmpeg process for '{channel_key}' already exited.")
 
-      duration = asyncio.get_event_loop().time() - start
+      duration = asyncio.get_event_loop().time() - start_time
       mb_sent = bytes_count / (1024 * 1024)
 
       logger.info(
-          f"Stream stopped: '{channel_name_display}' (key: '{channel_key}') [{pname}] (Source: {provider['url']}). "
+          f"Stream stopped: '{channel_name_display}' (key: '{channel_key}') [{pname}] (Source: {url}). "
           f"Duration: {duration:.1f}s, Sent: {mb_sent:.2f}MB, Reason: {reason}"
       )
 

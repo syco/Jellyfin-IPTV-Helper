@@ -1,5 +1,10 @@
+*.m3u
 *.swp
 /config.ini
+/modules
 /python
 /venv
 __pycache__
+
+!/modules/example.py
+!/test.m3u

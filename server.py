@@ -22,9 +22,9 @@ from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResp
 from typing import Any, Dict, List
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+  level=logging.INFO,
+  format="%(asctime)s [%(levelname)s] %(message)s",
+  datefmt="%Y-%m-%d %H:%M:%S",
 )
 logging.getLogger("streamlink").setLevel(logging.CRITICAL)
 
@@ -323,8 +323,8 @@ async def release_session(pname: str, channel_name: str, channel_key: str, url: 
 
   duration = asyncio.get_event_loop().time() - start_time
   logger.info(
-      f"Stream stopped: '{channel_name}' (key: '{channel_key}') [{pname}] (Source: {url}). "
-      f"Duration: {duration:.1f}s, Reason: completed/disconnected (Direct)"
+    f"Stream stopped: '{channel_name}' (key: '{channel_key}') [{pname}] (Source: {url}). "
+    f"Duration: {duration:.1f}s, Reason: completed/disconnected (Direct)"
   )
 
 async def external_app_stream(url: str):
@@ -511,8 +511,8 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
       mb_sent = bytes_count / (1024 * 1024)
 
       logger.info(
-          f"Stream stopped: '{channel_name_display}' (key: '{channel_key}') [{pname}] (Source: {url}). "
-          f"Duration: {duration:.1f}s, Sent: {mb_sent:.2f}MB, Reason: {reason}"
+        f"Stream stopped: '{channel_name_display}' (key: '{channel_key}') [{pname}] (Source: {url}). "
+        f"Duration: {duration:.1f}s, Sent: {mb_sent:.2f}MB, Reason: {reason}"
       )
 
       if TRACK_METRICS and duration > 0:

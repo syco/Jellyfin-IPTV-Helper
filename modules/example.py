@@ -10,7 +10,7 @@ class ExampleModule:
   Generates a continuous black frame video stream with silent audio using FFmpeg.
   """
 
-  def initialize(self):
+  async def initialize(self):
     """
     Called once when the plugin is loaded during server startup.
     Can be a regular function or an async function.

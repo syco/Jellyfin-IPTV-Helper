@@ -28,6 +28,12 @@ logging.basicConfig(
 )
 logging.getLogger("streamlink").setLevel(logging.CRITICAL)
 
+class NoNoisyLogsFilter(logging.Filter):
+  def filter(self, record):
+    msg = record.getMessage()
+    return "/discover.json" not in msg and "/lineup_status.json" not in msg
+logging.getLogger("uvicorn.access").addFilter(NoNoisyLogsFilter())
+
 logger = logging.getLogger("iptv-proxy")
 
 config = configparser.ConfigParser()
@@ -80,10 +86,7 @@ async def load_modules():
             obj = getattr(mod, attr)
             if isinstance(obj, type) and hasattr(obj, "initialize") and hasattr(obj, "stream"):
               instance = obj()
-              if inspect.iscoroutinefunction(instance.initialize):
-                await instance.initialize()
-              else:
-                instance.initialize()
+              await instance.initialize()
               LOADED_MODULES[module_name] = instance
               logger.info(f"Loaded plugin module: {module_name}")
               break
@@ -568,7 +571,6 @@ if ENABLE_PLEX_SUPPORT:
 
   @plex_router.get("/discover.json")
   async def discover(request: Request, response: Response):
-    logger.info(f"HDHomeRun discovery requested by {request.client.host if request.client else 'unknown'}")
     data = {
       "FriendlyName": "jelly-proxy",
       "Manufacturer": "Silicondust",

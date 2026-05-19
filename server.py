@@ -256,10 +256,7 @@ async def load_all():
   channel_index.clear()
   raw_channels.clear()
   for provider, cfg in PROVIDERS.items():
-    try:
-      await parse_m3u(cfg["file"], provider)
-    except Exception as e:
-      logger.error(f"Failed to load provider {provider}: {e}")
+    await parse_m3u(cfg["file"], provider)
   logger.info("Provider refresh complete.")
 
 async def periodic_refresh():
@@ -272,7 +269,8 @@ async def periodic_refresh():
     except asyncio.CancelledError:
       break
     except Exception as e:
-      logger.error(f"Error during periodic refresh: {e}")
+      logger.critical(f"Critical error during periodic refresh: {e}. Terminating application.")
+      os._exit(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

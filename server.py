@@ -61,6 +61,10 @@ if USE_STREAMLINK:
   try:
     import streamlink
     sl_session = streamlink.Streamlink()
+    # Optimize for lower latency and faster startup
+    sl_session.set_option("hls-live-edge", 2)
+    sl_session.set_option("hls-segment-threads", 3)
+    sl_session.set_option("http-timeout", 20.0)
   except ImportError:
     raise ImportError("Streamlink support is enabled in config, but the 'streamlink' package is not installed. Please run 'pip install streamlink'.")
 
@@ -436,7 +440,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
           fd = await asyncio.to_thread(selected_stream.open)
           try:
             while True:
-              chunk = await asyncio.to_thread(fd.read, 9400)
+              chunk = await asyncio.to_thread(fd.read, 65536)
               if not chunk:
                 reason = "source EOF"
                 break
@@ -467,7 +471,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
           )
 
           while True:
-            chunk = await process.stdout.read(9400)
+            chunk = await process.stdout.read(65536)
             if not chunk:
               reason = "source EOF"
               break
@@ -489,6 +493,9 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
       else:
         raise Exception("Invalid stream protocol or configuration")
 
+    except GeneratorExit:
+      reason = "client disconnected"
+      raise
     except Exception as e:
       reason = "error"
       logger.error(f"Stream generator error for '{channel_name_display}': {e}", exc_info=True)

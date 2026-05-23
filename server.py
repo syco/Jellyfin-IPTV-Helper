@@ -113,8 +113,10 @@ if config.has_section("mapping"):
   for orig_id, val in config.items("mapping"):
     parts = val.split("|")
     if len(parts) == 3:
-      idx, new_id, new_name = parts
-      CHANNEL_MAPPING[orig_id] = (int(idx), new_id, new_name)
+      idx = int(parts[0])
+      new_id = parts[1]
+      new_name = parts[2]
+      CHANNEL_MAPPING[orig_id] = (idx, new_id, new_name)
 
 channel_index: Dict[str, List[dict]] = defaultdict(list)
 raw_channels: List[dict] = []
@@ -128,6 +130,11 @@ def generate_device_id(host, port):
   """Generates a consistent device ID from host and port."""
   hash_input = f"{host}:{port}".encode()
   return hashlib.sha1(hash_input).hexdigest()[:8].upper()
+
+def normalize_name(name: str) -> str:
+  """Normalizes channel name: drops 'HD', leaves only alphanumeric, and lowercases."""
+  name = re.sub(r'(?i)hd', '', name)
+  return re.sub(r'[^a-zA-Z0-9\+]', '', name).lower()
 
 DEVICE_ID = generate_device_id(SERVER_HOST, SERVER_PORT)
 
@@ -211,29 +218,27 @@ async def parse_m3u(path: str, provider_id: str):
       logo_match = re.search(r'tvg-logo="([^"]+)"', line)
       current_logo = logo_match.group(1) if logo_match else None
 
-      raw_id = hashlib.md5((id_match.group(1) if id_match else raw_name).encode()).hexdigest()
+      norm_id = normalize_name(raw_name)
 
       raw_channels.append({
-        "raw_id": raw_id,
+        "raw_id": norm_id,
         "name": raw_name,
         "logo": current_logo,
         "provider": provider_id
       })
 
-
       if CHANNEL_MAPPING:
-        if raw_id not in CHANNEL_MAPPING:
-          logger.warning(f"Channel not found, id: '{raw_id}', name: '{raw_name}'")
+        if norm_id not in CHANNEL_MAPPING:
+          logger.warning(f"Channel not found in mapping, normalized id: '{norm_id}', name: '{raw_name}'")
           continue
 
-        idx, new_id, new_name = CHANNEL_MAPPING[raw_id]
+        idx, new_id, map_name = CHANNEL_MAPPING[norm_id]
         if idx > 0:
-          current_idx, current_id, current_name = idx, new_id, new_name
+          current_idx, current_id, current_name = idx, new_id, (map_name if map_name else raw_name)
         else:
-          current_idx, current_id, current_name = None, None, None
           continue
       else:
-        current_idx, current_id, current_name = -1, raw_id, raw_name
+        current_idx, current_id, current_name = -1, norm_id, raw_name
 
     elif line and not line.startswith("#") and current_idx and current_id and current_name:
       channel_index[current_id].append({

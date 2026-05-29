@@ -64,7 +64,6 @@ if USE_STREAMLINK:
     # Optimize for lower latency and faster startup
     sl_session.set_option("hls-live-edge", 3)
     sl_session.set_option("hls-segment-threads", 2)
-    sl_session.set_option("ringbuffer-size", "16M")
     sl_session.set_option("http-timeout", 20.0)
   except ImportError:
     raise ImportError("Streamlink support is enabled in config, but the 'streamlink' package is not installed. Please run 'pip install streamlink'.")

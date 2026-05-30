@@ -62,6 +62,7 @@ if USE_STREAMLINK:
     import streamlink
     sl_session = streamlink.Streamlink()
     # Optimize for lower latency and faster startup
+    sl_session.set_option("ringbuffer-size", 16 * 1024 * 1024)
     sl_session.set_option("hls-live-edge", 3)
     sl_session.set_option("hls-segment-threads", 2)
     sl_session.set_option("http-timeout", 20.0)

@@ -36,7 +36,7 @@ logging.getLogger("uvicorn.access").addFilter(NoNoisyLogsFilter())
 
 logger = logging.getLogger("iptv-proxy")
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(strict=False)
 config.read("config.ini")
 
 SERVER_HOST = config.get("server", "host", fallback="0.0.0.0")

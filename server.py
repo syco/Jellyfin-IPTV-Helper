@@ -16,8 +16,8 @@ import threading
 import uvicorn
 
 from collections import defaultdict
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request, Response, APIRouter, BackgroundTasks
+from contextlib import asynccontextmanager, suppress
+from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
 from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
 from typing import Any, Dict, List
 
@@ -52,6 +52,9 @@ STREAMLINK_QUALITY = config.get("general", "streamlink_quality", fallback="720p,
 ALLOW_EXTERNAL_APP = config.get("general", "allow_external_app", fallback=False)
 ENABLE_PLEX_SUPPORT = config.getboolean("general", "enable_plex_support", fallback=False)
 ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp", fallback=False))
+STREAM_CHUNK_SIZE = config.getint("general", "stream_chunk_size", fallback=9400)
+STREAM_READ_POLL_INTERVAL = config.getfloat("general", "stream_read_poll_interval", fallback=1.0)
+STREAM_CLEANUP_TIMEOUT = config.getfloat("general", "stream_cleanup_timeout", fallback=5.0)
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
   raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
@@ -126,6 +129,9 @@ locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
 http_client: httpx.AsyncClient = None
+
+class ClientDisconnected(Exception):
+  pass
 
 def generate_device_id(host, port):
   """Generates a consistent device ID from host and port."""
@@ -326,7 +332,75 @@ def pick_provider(channel: str):
 
   return None
 
-async def external_app_stream(url: str):
+async def terminate_process(process, label: str):
+  if not process or process.returncode is not None:
+    return
+
+  logger.info(f"Stopping {label} process pid={process.pid}")
+  with suppress(ProcessLookupError):
+    process.terminate()
+  try:
+    await asyncio.wait_for(process.wait(), timeout=STREAM_CLEANUP_TIMEOUT)
+    return
+  except asyncio.TimeoutError:
+    logger.warning(f"{label} process pid={process.pid} did not stop after terminate; killing.")
+
+  with suppress(ProcessLookupError):
+    process.kill()
+  with suppress(asyncio.TimeoutError):
+    await asyncio.wait_for(process.wait(), timeout=STREAM_CLEANUP_TIMEOUT)
+
+async def read_process_stdout(process, request: Request, label: str):
+  if not process.stdout:
+    return b""
+
+  read_task = asyncio.create_task(process.stdout.read(STREAM_CHUNK_SIZE))
+  try:
+    while True:
+      done, _ = await asyncio.wait({read_task}, timeout=STREAM_READ_POLL_INTERVAL)
+      if done:
+        return read_task.result()
+
+      if await request.is_disconnected():
+        raise ClientDisconnected()
+  except asyncio.CancelledError:
+    await terminate_process(process, label)
+    raise
+  finally:
+    if not read_task.done():
+      read_task.cancel()
+      with suppress(asyncio.CancelledError):
+        await read_task
+
+async def close_blocking_stream(stream, label: str):
+  try:
+    await asyncio.wait_for(asyncio.to_thread(stream.close), timeout=STREAM_CLEANUP_TIMEOUT)
+  except asyncio.TimeoutError:
+    logger.warning(f"Timed out closing {label} stream handle.")
+  except Exception as e:
+    logger.debug(f"Error closing {label} stream handle: {e}")
+
+async def read_blocking_stream(stream, request: Request, label: str):
+  read_task = asyncio.create_task(asyncio.to_thread(stream.read, STREAM_CHUNK_SIZE))
+  try:
+    while True:
+      done, _ = await asyncio.wait({read_task}, timeout=STREAM_READ_POLL_INTERVAL)
+      if done:
+        return read_task.result()
+
+      if await request.is_disconnected():
+        await close_blocking_stream(stream, label)
+        raise ClientDisconnected()
+  except asyncio.CancelledError:
+    await close_blocking_stream(stream, label)
+    raise
+  finally:
+    if not read_task.done():
+      read_task.cancel()
+      with suppress(asyncio.CancelledError):
+        await read_task
+
+async def external_app_stream(url: str, request: Request):
   """Generates a stream from an external application for direct hand-off."""
   cmd = shlex.split(url)
   process = await asyncio.create_subprocess_exec(
@@ -336,22 +410,19 @@ async def external_app_stream(url: str):
   )
   try:
     while True:
-      chunk = await process.stdout.read(9400)
+      chunk = await read_process_stdout(process, request, "external app")
       if not chunk:
         break
       yield chunk
+  except ClientDisconnected:
+    raise
   except Exception as e:
     logger.error(f"External app stream error: {e}")
   finally:
-    if process.returncode is None:
-      try:
-        process.kill()
-        await process.wait()
-      except Exception:
-        pass
+    await terminate_process(process, "external app")
 
 @app.get("/{channel_key}/")
-async def stream(channel_key: str, request: Request, background_tasks: BackgroundTasks):
+async def stream(channel_key: str, request: Request):
   client_host = request.client.host if request.client else "unknown"
   logger.info(f"New stream request for channel key: '{channel_key}' from {client_host}")
   if channel_key not in channel_index:
@@ -404,7 +475,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
       elif not url.startswith(("http://", "https://")):
         if ALLOW_EXTERNAL_APP:
           logger.info(f"Invoking external application for '{channel_name_display}'")
-          async for chunk in external_app_stream(url):
+          async for chunk in external_app_stream(url, request):
             if await request.is_disconnected():
               reason = "client disconnected"
               break
@@ -444,7 +515,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
           fd = await asyncio.to_thread(selected_stream.open)
           try:
             while True:
-              chunk = await asyncio.to_thread(fd.read, 9400)
+              chunk = await read_blocking_stream(fd, request, "Streamlink")
               if not chunk:
                 reason = "source EOF"
                 break
@@ -454,7 +525,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
               bytes_count += len(chunk)
               yield chunk
           finally:
-            await asyncio.to_thread(fd.close)
+            await close_blocking_stream(fd, "Streamlink")
 
         elif USE_FFMPEG:
           logger.info(f"Invoking FFmpeg for '{channel_name_display}'")
@@ -475,7 +546,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
           )
 
           while True:
-            chunk = await process.stdout.read(9400)
+            chunk = await read_process_stdout(process, request, "FFmpeg")
             if not chunk:
               reason = "source EOF"
               break
@@ -500,6 +571,8 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
     except GeneratorExit:
       reason = "client disconnected"
       raise
+    except ClientDisconnected:
+      reason = "client disconnected"
     except Exception as e:
       reason = "error"
       logger.error(f"Stream generator error for '{channel_name_display}': {e}", exc_info=True)
@@ -513,11 +586,7 @@ async def stream(channel_key: str, request: Request, background_tasks: Backgroun
         logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
 
       if process:
-        try:
-          process.kill()
-          await process.wait()
-        except ProcessLookupError:
-          logger.debug(f"FFmpeg process for '{channel_key}' already exited.")
+        await terminate_process(process, "FFmpeg")
 
       duration = asyncio.get_event_loop().time() - start_time
       mb_sent = bytes_count / (1024 * 1024)

@@ -1,0 +1,26 @@
+import streamlink
+
+proxy = "http://10.0.0.235:3128"
+
+s = streamlink.Streamlink()
+s.set_option("http-proxy", proxy)
+
+print("Streamlink:", streamlink.__version__)
+print("option:", s.get_option("http-proxy"))
+print("proxies:", s.http.proxies)
+
+streams = s.streams(
+  "http://10.0.0.232:5000/api/tby/live/554.m3u8"
+)
+
+print("streams:", streams.keys())
+print("best:", type(streams["best"]))
+print("best session:", streams["best"].session is s)
+print("best session proxies:", streams["best"].session.http.proxies)
+
+fd = streams["best"].open()
+
+while True:
+  data = fd.read(65536)
+  if not data:
+    break

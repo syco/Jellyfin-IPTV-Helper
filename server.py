@@ -59,19 +59,6 @@ STREAM_CLEANUP_TIMEOUT = config.getfloat("general", "stream_cleanup_timeout", fa
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
   raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
 
-sl_session = None
-if USE_STREAMLINK:
-  try:
-    import streamlink
-    sl_session = streamlink.Streamlink()
-    # Optimize for lower latency and faster startup
-    sl_session.set_option("ringbuffer-size", 16 * 1024 * 1024)
-    sl_session.set_option("hls-live-edge", 3)
-    sl_session.set_option("hls-segment-threads", 2)
-    sl_session.set_option("http-timeout", 20.0)
-  except ImportError:
-    raise ImportError("Streamlink support is enabled in config, but the 'streamlink' package is not installed. Please run 'pip install streamlink'.")
-
 PROVIDERS = {}
 LOADED_MODULES: Dict[str, Any] = {}
 
@@ -108,6 +95,7 @@ for section in config.sections():
       "file": config.get(section, "file"),
       "max_streams": config.getint(section, "max_streams", fallback=1),
       "priority": config.getint(section, "priority", fallback=10),
+      "proxy": config.get(section, "proxy", fallback="").strip() or None,
     }
 
 TUNER_COUNT = sum(p["max_streams"] for p in PROVIDERS.values())
@@ -204,7 +192,12 @@ def run_ssdp_server():
 async def parse_m3u(path: str, provider_id: str):
   logger.info(f"Parsing M3U for provider '{provider_id}' from {path}")
   if path.startswith(("http://", "https://")):
-    resp = await http_client.get(path)
+    proxy = PROVIDERS.get(provider_id, {}).get("proxy")
+    if proxy:
+      async with httpx.AsyncClient(timeout=None, proxy=proxy) as client:
+        resp = await client.get(path)
+    else:
+      resp = await http_client.get(path)
     resp.raise_for_status()
     content = resp.text
   else:
@@ -441,7 +434,9 @@ async def stream(channel_key: str, request: Request):
     active_sessions[pname] += 1
 
   url = provider["url"]
-  logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {url}]")
+  proxy = PROVIDERS[pname].get("proxy")
+  proxy_log = f" via proxy {proxy}" if proxy else ""
+  logger.info(f"Starting stream for '{channel_name_display}' (key: '{channel_key}') via '{pname}' [URL: {url}]{proxy_log}")
 
   async def generator():
     bytes_count = 0
@@ -485,47 +480,70 @@ async def stream(channel_key: str, request: Request):
           raise Exception("External applications are disabled")
 
       elif url.startswith("http://") or url.startswith("https://"):
-        if USE_STREAMLINK and sl_session:
+        if USE_STREAMLINK:
           logger.info(f"Invoking Streamlink for '{channel_name_display}'")
 
-          streams = await asyncio.to_thread(sl_session.streams, provider["url"])
-          if not streams:
-            raise Exception(f"No streams found for {provider['url']}")
-
-          selected_stream = None
-          selected_quality = "N/A"
-          for quality in STREAMLINK_QUALITY:
-            if quality in streams:
-              selected_stream = streams[quality]
-              selected_quality = quality
-              break
-
-          if not selected_stream:
-            if "best" in streams:
-              selected_stream = streams["best"]
-              selected_quality = "best"
-            elif streams:
-              selected_quality, selected_stream = list(streams.items())[0]
-
-          if not selected_stream:
-            raise Exception(f"Could not find a suitable stream for {provider['url']} with qualities {STREAMLINK_QUALITY}")
-
-          logger.debug(f"DEBUG: Playing stream (Quality: {selected_quality})")
-
-          fd = await asyncio.to_thread(selected_stream.open)
           try:
-            while True:
-              chunk = await read_blocking_stream(fd, request, "Streamlink")
-              if not chunk:
-                reason = "source EOF"
+            import streamlink
+            streamlink_session = streamlink.Streamlink()
+            # Optimize for lower latency and faster startup
+            streamlink_session.set_option("ringbuffer-size", 16 * 1024 * 1024)
+            streamlink_session.set_option("hls-live-edge", 3)
+            streamlink_session.set_option("hls-segment-threads", 2)
+            streamlink_session.set_option("http-timeout", 20.0)
+            if proxy:
+              streamlink_session.set_option("http-proxy", proxy)
+              streamlink_session.set_option("http-trust-env", False)
+              logger.info(
+                f"Streamlink proxy enabled for '{channel_name_display}': {proxy}"
+              )
+
+            streams = await asyncio.to_thread(streamlink_session.streams, provider["url"])
+            if not streams:
+              raise Exception(f"No streams found for {provider['url']}")
+
+            selected_stream = None
+            selected_quality = "N/A"
+            for quality in STREAMLINK_QUALITY:
+              if quality in streams:
+                selected_stream = streams[quality]
+                selected_quality = quality
                 break
-              if await request.is_disconnected():
-                reason = "client disconnected"
-                break
-              bytes_count += len(chunk)
-              yield chunk
-          finally:
-            await close_blocking_stream(fd, "Streamlink")
+
+            if not selected_stream:
+              if "best" in streams:
+                selected_stream = streams["best"]
+                selected_quality = "best"
+              elif streams:
+                selected_quality, selected_stream = list(streams.items())[0]
+
+            if not selected_stream:
+              raise Exception(f"Could not find a suitable stream for {provider['url']} with qualities {STREAMLINK_QUALITY}")
+
+            logger.debug(f"DEBUG: Playing stream (Quality: {selected_quality})")
+
+            if proxy:
+              selected_session = getattr(selected_stream, "session", None)
+              if selected_session is not None:
+                selected_session.set_option("http-proxy", proxy)
+                selected_session.set_option("http-trust-env", False)
+
+            fd = await asyncio.to_thread(selected_stream.open)
+            try:
+              while True:
+                chunk = await read_blocking_stream(fd, request, "Streamlink")
+                if not chunk:
+                  reason = "source EOF"
+                  break
+                if await request.is_disconnected():
+                  reason = "client disconnected"
+                  break
+                bytes_count += len(chunk)
+                yield chunk
+            finally:
+              await close_blocking_stream(fd, "Streamlink")
+          except ImportError:
+            raise ImportError("Streamlink support is enabled in config, but the 'streamlink' package is not installed. Please run 'pip install streamlink'.")
 
         elif USE_FFMPEG:
           logger.info(f"Invoking FFmpeg for '{channel_name_display}'")
@@ -533,11 +551,15 @@ async def stream(channel_key: str, request: Request):
             FFMPEG_PATH,
             "-loglevel", "error",
             "-hide_banner",
+          ]
+          if proxy:
+            cmd.extend(["-http_proxy", proxy])
+          cmd.extend([
             "-i", provider["url"],
             "-c", "copy",
             "-f", "mpegts",
             "pipe:1"
-          ]
+          ])
 
           process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -558,13 +580,23 @@ async def stream(channel_key: str, request: Request):
 
         else:
           logger.info(f"Opening direct HTTP stream for '{channel_name_display}'")
-          async with http_client.stream("GET", provider["url"]) as resp:
-            async for chunk in resp.aiter_bytes():
-              if await request.is_disconnected():
-                reason = "client disconnected"
-                break
-              bytes_count += len(chunk)
-              yield chunk
+          if proxy:
+            direct_client = httpx.AsyncClient(timeout=None, proxy=proxy)
+          else:
+            direct_client = http_client
+
+          try:
+            async with direct_client.stream("GET", provider["url"]) as resp:
+              resp.raise_for_status()
+              async for chunk in resp.aiter_bytes():
+                if await request.is_disconnected():
+                  reason = "client disconnected"
+                  break
+                bytes_count += len(chunk)
+                yield chunk
+          finally:
+            if proxy:
+              await direct_client.aclose()
       else:
         raise Exception("Invalid stream protocol or configuration")
 

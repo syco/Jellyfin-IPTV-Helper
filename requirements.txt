@@ -1,4 +1,5 @@
 fastapi
 httpx
 streamlink
+urllib3<2.8
 uvicorn

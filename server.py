@@ -55,6 +55,10 @@ ENABLE_SSDP = (ENABLE_PLEX_SUPPORT and config.getboolean("general", "enable_ssdp
 STREAM_CHUNK_SIZE = config.getint("general", "stream_chunk_size", fallback=9400)
 STREAM_READ_POLL_INTERVAL = config.getfloat("general", "stream_read_poll_interval", fallback=1.0)
 STREAM_CLEANUP_TIMEOUT = config.getfloat("general", "stream_cleanup_timeout", fallback=5.0)
+STREAM_TIMEOUT = config.getfloat("general", "stream_timeout", fallback=6 * 60 * 60)
+
+if STREAM_TIMEOUT <= 0:
+  raise ValueError("general.stream_timeout must be greater than zero seconds")
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
   raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
@@ -347,6 +351,10 @@ async def read_process_stdout(process, request: Request, label: str):
   if not process.stdout:
     return b""
 
+  if await request.is_disconnected():
+    await terminate_process(process, label)
+    raise ClientDisconnected()
+
   read_task = asyncio.create_task(process.stdout.read(STREAM_CHUNK_SIZE))
   try:
     while True:
@@ -357,6 +365,9 @@ async def read_process_stdout(process, request: Request, label: str):
       if await request.is_disconnected():
         raise ClientDisconnected()
   except asyncio.CancelledError:
+    await terminate_process(process, label)
+    raise
+  except ClientDisconnected:
     await terminate_process(process, label)
     raise
   finally:
@@ -442,6 +453,20 @@ async def stream(channel_key: str, request: Request):
     bytes_count = 0
     process = None
     reason = "completed"
+    timed_out = False
+    stream_task = asyncio.current_task()
+
+    if stream_task is None:
+      raise RuntimeError("Stream generator must run inside an asyncio task")
+
+    def cancel_for_timeout():
+      nonlocal timed_out
+      timed_out = True
+      stream_task.cancel()
+
+    timeout_handle = asyncio.get_running_loop().call_later(
+      STREAM_TIMEOUT, cancel_for_timeout
+    )
 
     try:
       if url.startswith("module://"):
@@ -551,6 +576,7 @@ async def stream(channel_key: str, request: Request):
             FFMPEG_PATH,
             "-loglevel", "error",
             "-hide_banner",
+            "-nostdin",
           ]
           if proxy:
             cmd.extend(["-http_proxy", proxy])
@@ -603,6 +629,10 @@ async def stream(channel_key: str, request: Request):
     except GeneratorExit:
       reason = "client disconnected"
       raise
+    except asyncio.CancelledError:
+      reason = "stream timeout" if timed_out else "client disconnected"
+      if not timed_out:
+        raise
     except ClientDisconnected:
       reason = "client disconnected"
     except Exception as e:
@@ -613,6 +643,8 @@ async def stream(channel_key: str, request: Request):
         logger.warning(f"Metric penalty applied to '{pname}' due to error.")
 
     finally:
+      timeout_handle.cancel()
+
       async with locks["session_management"]:
         active_sessions[pname] = max(0, active_sessions[pname] - 1)
         logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")

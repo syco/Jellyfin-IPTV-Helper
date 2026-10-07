@@ -371,13 +371,17 @@ def pick_provider(channel: str):
     if p["provider"] not in failures
   ]
 
+  if not preferred_providers and failures:
+    logger.info(
+      f"No unfailed providers are available for '{channel}'; "
+      "clearing its failed-provider cache."
+    )
+    clear_provider_failures(channel, "no unfailed providers available")
+    failures = failed_providers[channel]
+    preferred_providers = available_providers
+
   for p, s in preferred_providers or available_providers:
     provider_name = p["provider"]
-    if provider_name in failures:
-      logger.info(
-        f"No unused provider is currently available for '{channel}'; "
-        f"retrying previously failed provider '{provider_name}'."
-      )
     logger.info(f"Selected provider '{provider_name}' for '{channel}' (score: {s:.2f})")
     return p
 

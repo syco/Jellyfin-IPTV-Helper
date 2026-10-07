@@ -19,7 +19,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Request, Response, APIRouter
 from fastapi.responses import StreamingResponse, PlainTextResponse, RedirectResponse, JSONResponse
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 logging.basicConfig(
   level=logging.INFO,
@@ -119,6 +119,7 @@ raw_channels: List[dict] = []
 active_sessions: Dict[str, int] = defaultdict(int)
 locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
+failed_providers: Dict[str, Set[str]] = defaultdict(set)
 
 http_client: httpx.AsyncClient = None
 
@@ -303,6 +304,13 @@ app = FastAPI(lifespan=lifespan)
 
 def pick_provider(channel: str):
   providers = channel_index[channel]
+  provider_names = {p["provider"] for p in providers}
+  failures = failed_providers[channel]
+  failures.intersection_update(provider_names)
+
+  if provider_names and failures == provider_names:
+    logger.info(f"All providers have failed to open '{channel}'; allowing them to be retried.")
+    failures.clear()
 
   def score(p):
     provider = p["provider"]
@@ -321,11 +329,24 @@ def pick_provider(channel: str):
 
   sorted_providers = sorted(scored_list, key=lambda x: x[1])
 
-  for p, s in sorted_providers:
+  available_providers = [
+    (p, s) for p, s in sorted_providers
+    if active_sessions[p["provider"]] < PROVIDERS[p["provider"]]["max_streams"]
+  ]
+  preferred_providers = [
+    (p, s) for p, s in available_providers
+    if p["provider"] not in failures
+  ]
+
+  for p, s in preferred_providers or available_providers:
     provider_name = p["provider"]
-    if active_sessions[provider_name] < PROVIDERS[provider_name]["max_streams"]:
-      logger.info(f"Selected provider '{provider_name}' for '{channel}' (score: {s:.2f})")
-      return p
+    if provider_name in failures:
+      logger.info(
+        f"No unused provider is currently available for '{channel}'; "
+        f"retrying previously failed provider '{provider_name}'."
+      )
+    logger.info(f"Selected provider '{provider_name}' for '{channel}' (score: {s:.2f})")
+    return p
 
   return None
 
@@ -645,9 +666,22 @@ async def stream(channel_key: str, request: Request):
     finally:
       timeout_handle.cancel()
 
+      if bytes_count == 0 and reason == "completed":
+        reason = "source EOF"
+
+      failed_to_open = bytes_count == 0 and reason in {
+        "error", "source EOF", "stream timeout"
+      }
+
       async with locks["session_management"]:
         active_sessions[pname] = max(0, active_sessions[pname] - 1)
         logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
+        if failed_to_open:
+          failed_providers[channel_key].add(pname)
+          logger.warning(
+            f"Remembering provider '{pname}' failed to open '{channel_key}'; "
+            "a different provider will be preferred on the next request."
+          )
 
       if process:
         await terminate_process(process, "FFmpeg")

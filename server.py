@@ -56,9 +56,12 @@ STREAM_CHUNK_SIZE = config.getint("general", "stream_chunk_size", fallback=9400)
 STREAM_READ_POLL_INTERVAL = config.getfloat("general", "stream_read_poll_interval", fallback=1.0)
 STREAM_CLEANUP_TIMEOUT = config.getfloat("general", "stream_cleanup_timeout", fallback=5.0)
 STREAM_TIMEOUT = config.getfloat("general", "stream_timeout", fallback=6 * 60 * 60)
+PROVIDER_FAILURE_TIMEOUT = config.getfloat("general", "provider_failure_timeout", fallback=300.0)
 
 if STREAM_TIMEOUT <= 0:
   raise ValueError("general.stream_timeout must be greater than zero seconds")
+if PROVIDER_FAILURE_TIMEOUT <= 0:
+  raise ValueError("general.provider_failure_timeout must be greater than zero seconds")
 
 if USE_FFMPEG and not shutil.which(FFMPEG_PATH):
   raise FileNotFoundError(f"FFmpeg executable not found at '{FFMPEG_PATH}'. Please ensure FFmpeg is installed and the path is correctly configured in config.ini.")
@@ -120,6 +123,7 @@ active_sessions: Dict[str, int] = defaultdict(int)
 locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 metrics: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
 failed_providers: Dict[str, Set[str]] = defaultdict(set)
+failure_reset_handles: Dict[str, asyncio.TimerHandle] = {}
 
 http_client: httpx.AsyncClient = None
 
@@ -298,9 +302,37 @@ async def lifespan(app: FastAPI):
   yield
   if refresh_task:
     refresh_task.cancel()
+  for reset_handle in failure_reset_handles.values():
+    reset_handle.cancel()
+  failure_reset_handles.clear()
   await http_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
+
+def clear_provider_failures(channel: str, reason: str = "manual"):
+  failures = failed_providers.pop(channel, set())
+  reset_handle = failure_reset_handles.pop(channel, None)
+  if reset_handle and not reset_handle.cancelled():
+    reset_handle.cancel()
+
+  if failures:
+    logger.info(
+      f"Cleared {len(failures)} failed provider(s) for '{channel}' ({reason})."
+    )
+
+def remember_provider_failure(channel: str, provider: str):
+  failed_providers[channel].add(provider)
+
+  reset_handle = failure_reset_handles.pop(channel, None)
+  if reset_handle and not reset_handle.cancelled():
+    reset_handle.cancel()
+
+  failure_reset_handles[channel] = asyncio.get_running_loop().call_later(
+    PROVIDER_FAILURE_TIMEOUT,
+    clear_provider_failures,
+    channel,
+    "timeout",
+  )
 
 def pick_provider(channel: str):
   providers = channel_index[channel]
@@ -310,7 +342,8 @@ def pick_provider(channel: str):
 
   if provider_names and failures == provider_names:
     logger.info(f"All providers have failed to open '{channel}'; allowing them to be retried.")
-    failures.clear()
+    clear_provider_failures(channel, "all providers exhausted")
+    failures = failed_providers[channel]
 
   def score(p):
     provider = p["provider"]
@@ -472,6 +505,7 @@ async def stream(channel_key: str, request: Request):
 
   async def generator():
     bytes_count = 0
+    opened = False
     process = None
     reason = "completed"
     timed_out = False
@@ -488,6 +522,13 @@ async def stream(channel_key: str, request: Request):
     timeout_handle = asyncio.get_running_loop().call_later(
       STREAM_TIMEOUT, cancel_for_timeout
     )
+
+    def mark_opened():
+      nonlocal opened
+      if opened:
+        return
+      opened = True
+      clear_provider_failures(channel_key, f"opened via {pname}")
 
     try:
       if url.startswith("module://"):
@@ -508,6 +549,8 @@ async def stream(channel_key: str, request: Request):
             if await request.is_disconnected():
               reason = "client disconnected"
               break
+            if chunk:
+              mark_opened()
             bytes_count += len(chunk)
             yield chunk
         else:
@@ -520,6 +563,8 @@ async def stream(channel_key: str, request: Request):
             if await request.is_disconnected():
               reason = "client disconnected"
               break
+            if chunk:
+              mark_opened()
             bytes_count += len(chunk)
             yield chunk
         else:
@@ -584,6 +629,7 @@ async def stream(channel_key: str, request: Request):
                 if await request.is_disconnected():
                   reason = "client disconnected"
                   break
+                mark_opened()
                 bytes_count += len(chunk)
                 yield chunk
             finally:
@@ -622,6 +668,7 @@ async def stream(channel_key: str, request: Request):
             if await request.is_disconnected():
               reason = "client disconnected"
               break
+            mark_opened()
             bytes_count += len(chunk)
             yield chunk
 
@@ -639,6 +686,8 @@ async def stream(channel_key: str, request: Request):
                 if await request.is_disconnected():
                   reason = "client disconnected"
                   break
+                if chunk:
+                  mark_opened()
                 bytes_count += len(chunk)
                 yield chunk
           finally:
@@ -677,10 +726,11 @@ async def stream(channel_key: str, request: Request):
         active_sessions[pname] = max(0, active_sessions[pname] - 1)
         logger.debug(f"Active sessions for provider '{pname}': {active_sessions[pname]}")
         if failed_to_open:
-          failed_providers[channel_key].add(pname)
+          remember_provider_failure(channel_key, pname)
           logger.warning(
             f"Remembering provider '{pname}' failed to open '{channel_key}'; "
-            "a different provider will be preferred on the next request."
+            f"a different provider will be preferred for {PROVIDER_FAILURE_TIMEOUT:g}s "
+            "or until the channel opens."
           )
 
       if process:
@@ -741,6 +791,21 @@ async def get_unused_mappings():
     return {}
   used_raw_ids = {c["raw_id"] for c in raw_channels}
   return {k: v for k, v in CHANNEL_MAPPING.items() if k not in used_raw_ids}
+
+@app.get("/debug/failed-count")
+async def get_failed_count():
+  channels = {
+    channel: {
+      "failed_count": len(providers),
+      "providers": sorted(providers),
+    }
+    for channel, providers in failed_providers.items()
+    if providers
+  }
+  return {
+    "failed_count": sum(details["failed_count"] for details in channels.values()),
+    "channels": channels,
+  }
 
 if ENABLE_PLEX_SUPPORT:
   plex_router = APIRouter()

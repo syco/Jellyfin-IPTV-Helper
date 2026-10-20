@@ -203,7 +203,7 @@ async def parse_m3u(path: str, provider_id: str):
   if path.startswith(("http://", "https://")):
     proxy = PROVIDERS.get(provider_id, {}).get("proxy")
     if proxy:
-      async with httpx.AsyncClient(timeout=None, proxy=proxy) as client:
+      async with httpx.AsyncClient(timeout=None, proxy=proxy, trust_env=False) as client:
         resp = await client.get(path)
     else:
       resp = await http_client.get(path)
@@ -218,6 +218,7 @@ async def parse_m3u(path: str, provider_id: str):
   current_name = None
   current_logo = None
   count = 0
+  unmapped_channels = []
 
   for line in content.splitlines():
     line = line.strip()
@@ -238,7 +239,7 @@ async def parse_m3u(path: str, provider_id: str):
 
       if CHANNEL_MAPPING:
         if norm_id not in CHANNEL_MAPPING:
-          logger.warning(f"Channel not found in mapping, normalized id: '{norm_id}', name: '{raw_name}'")
+          unmapped_channels.append(f"{raw_name} ({norm_id})")
           continue
 
         idx, new_id, map_name = CHANNEL_MAPPING[norm_id]
@@ -264,13 +265,28 @@ async def parse_m3u(path: str, provider_id: str):
       count += 1
 
   logger.info(f"Loaded {count} channels from provider '{provider_id}'")
+  if unmapped_channels:
+    sample = ", ".join(unmapped_channels[:5])
+    suffix = "" if len(unmapped_channels) <= 5 else ", ..."
+    logger.warning(
+      f"Provider '{provider_id}' has {len(unmapped_channels)} channel(s) without "
+      f"a mapping; skipped them. First entries: {sample}{suffix}"
+    )
 
 async def load_all():
   logger.info("Refreshing all provider playlists...")
   channel_index.clear()
   raw_channels.clear()
   for provider, cfg in PROVIDERS.items():
-    await parse_m3u(cfg["file"], provider)
+    try:
+      await parse_m3u(cfg["file"], provider)
+    except asyncio.CancelledError:
+      raise
+    except (OSError, httpx.HTTPError) as exc:
+      logger.error(
+        f"Could not load playlist for provider '{provider}' from "
+        f"{cfg['file']}: {type(exc).__name__}: {exc}. Skipping this provider."
+      )
   logger.info("Provider refresh complete.")
 
 async def periodic_refresh():
@@ -289,7 +305,7 @@ async def periodic_refresh():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   global http_client
-  http_client = httpx.AsyncClient(timeout=None)
+  http_client = httpx.AsyncClient(timeout=None, trust_env=False)
   await load_modules()
   await load_all()
 
